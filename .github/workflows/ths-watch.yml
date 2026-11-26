@@ -1,0 +1,48 @@
+name: ths-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"      # 每 10 分钟（UTC），北京时间同样每 10 分钟
+  workflow_dispatch:            # 支持手动点一下立即运行
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ths-watch
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run watcher
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_DOC_ID: ${{ secrets.FEISHU_DOC_ID }}
+        run: python ths_watch.py --once
+
+      - name: Commit archive
+        run: |
+          git config user.name  "ths-watch-bot"
+          git config user.email "ths-watch-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+          fi
