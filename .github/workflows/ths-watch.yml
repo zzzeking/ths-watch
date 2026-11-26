@@ -2,7 +2,7 @@ name: ths-watch
 
 on:
   schedule:
-    - cron: "*/60 * * * *"      # 每 60 分钟（UTC），北京时间同样每 10 分钟
+    - cron: "0 * * * *"      # 每小时整点跑一次
   workflow_dispatch:            # 支持手动点一下立即运行
 
 permissions:
