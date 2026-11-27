@@ -2,8 +2,17 @@ name: ths-watch
 
 on:
   schedule:
-    - cron: "0 * * * *"      # 每小时整点跑一次
-  workflow_dispatch:            # 支持手动点一下立即运行
+    # 每小时第 7 分钟启动（避开整点高峰），启动后循环跑 55 分钟，实现近似连续监控
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_feishu:
+        description: "只发一条测试消息到飞书，验证通道（不抓取）"
+        type: boolean
+        default: false
+      rounds:
+        description: "手动触发跑几轮，每轮间隔 5 分钟（默认 1）"
+        default: "1"
 
 permissions:
   contents: write
@@ -15,7 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 70
 
     steps:
       - uses: actions/checkout@v4
@@ -27,22 +36,44 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Run watcher
+      - name: Watch loop
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_DOC_ID: ${{ secrets.FEISHU_DOC_ID }}
-        run: python ths_watch.py --once
-
-      - name: Commit archive
         run: |
+          set -u
+
+          # 只测飞书通道
+          if [ "${{ inputs.test_feishu }}" = "true" ]; then
+            python ths_watch.py --test
+            exit 0
+          fi
+
+          # 定时触发跑 11 轮（约 55 分钟），手动触发默认 1 轮
+          ROUNDS="${{ inputs.rounds }}"
+          if [ -z "$ROUNDS" ]; then ROUNDS=11; fi
+          echo "本轮共 $ROUNDS 轮"
+
           git config user.name  "ths-watch-bot"
           git config user.email "ths-watch-bot@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "no changes"
-          else
-            git commit -m "update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
-          fi
+
+          for i in $(seq 1 "$ROUNDS"); do
+            echo "::group::第 $i/$ROUNDS 轮  $(date -u +'%H:%M:%SZ')"
+            python ths_watch.py --once || echo "本轮抓取异常，继续下一轮"
+
+            # 每轮结束就提交，避免任务被中断时丢数据
+            git add -A
+            if git diff --cached --quiet; then
+              echo "无文件变化"
+            else
+              git commit -m "update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              git push || echo "推送失败，下一轮重试"
+            fi
+            echo "::endgroup::"
+
+            if [ "$i" -lt "$ROUNDS" ]; then
+              sleep 300
+            fi
+          done
