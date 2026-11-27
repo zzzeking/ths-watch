@@ -6,16 +6,18 @@
 数据源：同花顺社区公开接口（无需登录、无需 token）
 归档位置：data/YYYY-MM-DD.md（按北京时间分日）
 
-飞书同步（两种方式可任选，都不配则只做本地归档）：
-  1) FEISHU_WEBHOOK      群自定义机器人 webhook，有新发言立刻推到飞书群
-  2) FEISHU_APP_ID + FEISHU_APP_SECRET + FEISHU_DOC_ID
-                         自建应用凭证，把新发言追加进指定飞书文档
+飞书同步（配了哪个就走哪个，都不配则只做本地归档）：
+  FEISHU_WEBHOOK                       群自定义机器人，有新发言推送到群
+  FEISHU_APP_ID + FEISHU_APP_SECRET    自建应用凭证，用于上传图片（消息里直接显示图）
+  FEISHU_DOC_ID                        可选，配了就把发言追加进这个飞书文档（含图片）
 
 用法：
-    python ths_watch.py          本机持续监控（每 INTERVAL 秒）
+    python ths_watch.py          本机持续监控
     python ths_watch.py --once   只跑一次就退出（GitHub Actions 用这个）
+    python ths_watch.py --test   发一条测试消息到飞书，验证通道是否打通
 """
 
+import base64
 import html
 import json
 import os
@@ -29,7 +31,7 @@ import requests
 # ---------- 配置 ----------
 UID = "639669238"
 NICKNAME = "全能的野人"
-INTERVAL = 180                      # 本机持续模式下的轮询间隔（秒）
+INTERVAL = 180
 API = "https://t.10jqka.com.cn/lgt/post/open/api/user/post"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
@@ -37,7 +39,7 @@ STATE_DIR = os.path.join(ROOT, "state")
 SEEN_FILE = os.path.join(STATE_DIR, "seen.json")
 MAX_SEEN = 5000
 
-CST = timezone(timedelta(hours=8))  # GitHub runner 是 UTC，必须显式指定北京时间
+CST = timezone(timedelta(hours=8))
 
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "").strip()
@@ -52,6 +54,8 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+IMG_HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
+
 
 # ---------- 工具 ----------
 
@@ -60,7 +64,6 @@ def log(msg):
 
 
 def clean_text(raw):
-    """把社区富文本转成纯文本，股票标签保留 $名称(代码)$ 形式。"""
     s = raw or ""
     s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
     s = re.sub(r"</(p|div)>", "\n", s, flags=re.I)
@@ -72,7 +75,6 @@ def clean_text(raw):
 
 
 def extract_stocks(raw):
-    """抽取 $名称(代码)$ 里的股票，返回 [(名称, 代码)]。"""
     out, seen = [], set()
     for name, code in re.findall(r"\$([^$()]{1,30})\((\d{6})\)\$", raw or ""):
         if code not in seen:
@@ -87,7 +89,7 @@ def post_images(post):
 
 def load_seen():
     if not os.path.exists(SEEN_FILE):
-        return None                      # None 表示首次运行
+        return None
     try:
         with open(SEEN_FILE, encoding="utf-8") as f:
             return set(json.load(f))
@@ -113,6 +115,17 @@ def fetch_posts():
     return j.get("data") or []
 
 
+def fetch_image(url, timeout=30):
+    """下载图片，失败返回 None 而不是抛错。"""
+    try:
+        r = requests.get(url, headers=IMG_HEADERS, timeout=timeout)
+        if r.status_code == 200 and r.content:
+            return r.content
+    except Exception as e:
+        log(f"图片下载失败 {url[:60]}: {e}")
+    return None
+
+
 # ---------- 本地 Markdown 归档 ----------
 
 def render_entry(post):
@@ -126,8 +139,9 @@ def render_entry(post):
     imgs = post_images(post)
     if imgs:
         lines.append("")
-        for i, u in enumerate(imgs, 1):
-            lines.append(f"- [图片{i}]({u})")
+        for u in imgs:
+            lines.append(f"![]({u})")
+        lines.append("")
 
     stocks = extract_stocks(post.get("content"))
     if stocks:
@@ -158,35 +172,7 @@ def append_to_day(post):
     return path
 
 
-# ---------- 飞书：群机器人推送 ----------
-
-def notify_webhook(post):
-    if not FEISHU_WEBHOOK:
-        return False
-    dt = datetime.fromtimestamp(post.get("ctime") or 0, CST)
-    body = clean_text(post.get("content"))
-    stocks = extract_stocks(post.get("content"))
-    link = post.get("jump_url") or ""
-
-    text = f"{dt:%Y-%m-%d %H:%M:%S}  {NICKNAME}\n\n{body}"
-    if stocks:
-        text += "\n\n提及：" + "、".join(f"{n}({c})" for n, c in stocks)
-    if link:
-        text += f"\n\n{link}"
-
-    payload = {"msg_type": "text", "content": {"text": text}}
-    try:
-        r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=15)
-        ok = r.json().get("code") == 0
-        if not ok:
-            log(f"飞书群推送失败：{r.text[:150]}")
-        return ok
-    except Exception as e:
-        log(f"飞书群推送异常：{e}")
-        return False
-
-
-# ---------- 飞书：写入文档 ----------
+# ---------- 飞书：鉴权 ----------
 
 def tenant_token():
     r = requests.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -198,24 +184,119 @@ def tenant_token():
     return j["tenant_access_token"]
 
 
-def _text_block(text, style=None):
-    return {
-        "block_type": 2,
-        "text": {
-            "style": style or {},
-            "elements": [{"text_run": {"content": text}}],
-        },
-    }
+def upload_im_image(token, content, filename="img.jpg"):
+    """上传图片到飞书，拿到 image_key，用于消息里直接显示图。"""
+    try:
+        r = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": (filename, content, "image/jpeg")},
+            timeout=40,
+        )
+        j = r.json()
+        if j.get("code") == 0:
+            return j["data"]["image_key"]
+        log(f"飞书图片上传失败：{str(j)[:160]}")
+    except Exception as e:
+        log(f"飞书图片上传异常：{e}")
+    return None
+
+
+def upload_docx_image(token, content, filename="img.jpg"):
+    """上传图片到飞书文档素材库，拿到 file_token，用于文档内嵌图片。"""
+    try:
+        r = requests.post(
+            "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all",
+            headers={"Authorization": f"Bearer {token}"},
+            data={
+                "file_name": filename,
+                "parent_type": "docx_image",
+                "parent_node": FEISHU_DOC_ID,
+                "size": str(len(content)),
+            },
+            files={"file": (filename, content, "image/jpeg")},
+            timeout=60,
+        )
+        j = r.json()
+        if j.get("code") == 0:
+            return j["data"]["file_token"]
+        log(f"飞书文档图片上传失败：{str(j)[:160]}")
+    except Exception as e:
+        log(f"飞书文档图片上传异常：{e}")
+    return None
+
+
+# ---------- 飞书：群机器人推送 ----------
+
+def notify_webhook(post, token=None):
+    if not FEISHU_WEBHOOK:
+        return False
+
+    dt = datetime.fromtimestamp(post.get("ctime") or 0, CST)
+    body = clean_text(post.get("content"))
+    stocks = extract_stocks(post.get("content"))
+    link = post.get("jump_url") or ""
+    imgs = post_images(post)
+    title = f"{NICKNAME} · {dt:%m-%d %H:%M:%S}"
+
+    tail = ""
+    if stocks:
+        tail += "\n\n提及：" + "、".join(f"{n}({c})" for n, c in stocks)
+    if link:
+        tail += f"\n原文：{link}"
+
+    # 有应用凭证：上传图片，用富文本消息把图直接显示出来
+    image_keys = []
+    if token and imgs:
+        for i, u in enumerate(imgs, 1):
+            data = fetch_image(u)
+            if not data:
+                continue
+            key = upload_im_image(token, data, f"{post.get('id')}_{i}.jpg")
+            if key:
+                image_keys.append(key)
+
+    if image_keys:
+        content = [[{"tag": "text", "text": body}]]
+        for k in image_keys:
+            content.append([{"tag": "img", "image_key": k}])
+        if tail.strip():
+            content.append([{"tag": "text", "text": tail.strip()}])
+        payload = {
+            "msg_type": "post",
+            "content": {"post": {"zh_cn": {"title": title, "content": content}}},
+        }
+    else:
+        text = f"{title}\n\n{body}{tail}"
+        if imgs:
+            text += "\n\n图片：\n" + "\n".join(imgs)
+        payload = {"msg_type": "text", "content": {"text": text}}
+
+    try:
+        r = requests.post(FEISHU_WEBHOOK, json=payload, timeout=20)
+        j = r.json()
+        ok = j.get("code") == 0 or j.get("StatusCode") == 0
+        if not ok:
+            log(f"飞书群推送失败：{str(j)[:160]}")
+        return ok
+    except Exception as e:
+        log(f"飞书群推送异常：{e}")
+        return False
+
+
+# ---------- 飞书：写入文档 ----------
+
+def _text_block(text):
+    return {"block_type": 2, "text": {"style": {}, "elements": [{"text_run": {"content": text}}]}}
 
 
 def _heading_block(text):
-    return {
-        "block_type": 5,   # heading3
-        "heading3": {
-            "style": {},
-            "elements": [{"text_run": {"content": text}}],
-        },
-    }
+    return {"block_type": 5, "heading3": {"style": {}, "elements": [{"text_run": {"content": text}}]}}
+
+
+def _image_block(file_token):
+    return {"block_type": 27, "image": {"token": file_token}}
 
 
 def append_to_feishu_doc(token, post):
@@ -232,10 +313,16 @@ def append_to_feishu_doc(token, post):
         if chunk.strip():
             children.append(_text_block(chunk))
 
+    for i, u in enumerate(imgs, 1):
+        data = fetch_image(u)
+        ft = upload_docx_image(token, data, f"{post.get('id')}_{i}.jpg") if data else None
+        if ft:
+            children.append(_image_block(ft))
+        else:
+            children.append(_text_block(f"图片{i}：{u}"))
+
     if stocks:
         children.append(_text_block("提及：" + "、".join(f"{n}({c})" for n, c in stocks)))
-    for i, u in enumerate(imgs, 1):
-        children.append(_text_block(f"图片{i}：{u}"))
     if link:
         children.append(_text_block(f"原文：{link}"))
     children.append(_text_block("—" * 10))
@@ -243,7 +330,7 @@ def append_to_feishu_doc(token, post):
     url = (f"https://open.feishu.cn/open-apis/docx/v1/documents/{FEISHU_DOC_ID}"
            f"/blocks/{FEISHU_DOC_ID}/children")
     r = requests.post(url, headers={"Authorization": f"Bearer {token}"},
-                      json={"children": children, "index": -1}, timeout=20)
+                      json={"children": children, "index": -1}, timeout=30)
     j = r.json()
     if j.get("code") != 0:
         log(f"飞书文档写入失败：{str(j)[:200]}")
@@ -254,10 +341,9 @@ def append_to_feishu_doc(token, post):
 # ---------- 主流程 ----------
 
 def deliver(post, token):
-    """把一条新发言落到本地 + 飞书。"""
     append_to_day(post)
-    notify_webhook(post)
-    if token:
+    notify_webhook(post, token)
+    if token and FEISHU_DOC_ID:
         append_to_feishu_doc(token, post)
 
 
@@ -278,22 +364,44 @@ def poll(seen, token):
     return len(new)
 
 
+def send_test(token):
+    log("发送飞书测试消息…")
+    post = {
+        "id": "test",
+        "ctime": int(time.time()),
+        "content": "这是一条测试消息。如果你在飞书里看到了它，说明推送通道已经打通。",
+        "jump_url": "",
+        "ip_location": {"province_name": "本地"},
+        "stat": {"reply": 0, "like": 0},
+        "ext": {},
+    }
+    ok = notify_webhook(post, token)
+    log("群推送结果：" + ("成功" if ok else "失败/未配置"))
+    if token and FEISHU_DOC_ID:
+        ok2 = append_to_feishu_doc(token, post)
+        log("文档写入结果：" + ("成功" if ok2 else "失败"))
+
+
 def main():
     once = "--once" in sys.argv
-    log(f"开始监控「{NICKNAME}」(uid={UID})"
-        + ("（单次模式）" if once else f"，间隔 {INTERVAL} 秒"))
+    test = "--test" in sys.argv
+    log(f"开始监控「{NICKNAME}」(uid={UID})" + ("（单次模式）" if once else f"，间隔 {INTERVAL} 秒"))
 
     token = None
-    if FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_DOC_ID:
+    if FEISHU_APP_ID and FEISHU_APP_SECRET:
         try:
             token = tenant_token()
-            log("飞书文档同步已启用")
+            log("飞书应用凭证有效，图片上传已启用"
+                + ("，文档同步已启用" if FEISHU_DOC_ID else "，未配置文档 ID"))
         except Exception as e:
-            log(f"飞书文档同步不可用：{e}")
+            log(f"飞书应用凭证不可用：{e}")
+
+    if test:
+        send_test(token)
+        return
 
     seen = load_seen()
     if seen is None:
-        # 首次运行：归档当前可见发言作为基线，不推送（避免一上来刷屏）
         try:
             posts = sorted(fetch_posts(), key=lambda p: p.get("ctime") or 0)
             for p in posts:
